@@ -32,6 +32,9 @@ def load_dense_retriever():
     faiss_index_path = os.path.join(data_dir, "faiss_index_arab.faiss")
     
     qbc_arab = pd.read_csv(qbc_arab_path)
+    # Create unique IDs
+    qbc_arab['passage_id'] = qbc_arab.apply(lambda r: f"{r.surah_number}:{r.ayah_start}-{r.ayah_end}", axis=1)
+    # Load precomputed passage embeddings and FAISS index    
     passage_embeddings_arab = np.load(passage_emb_path)
     faiss_index = faiss.read_index(faiss_index_path)
     embed_model_arab = SentenceTransformer("FDSRashid/QulBERT")
@@ -48,8 +51,13 @@ def load_sparse_retriever():
     tfidf_matrix_path = os.path.join(data_dir, "tfidf_matrix.npz")
     
     qbc = pd.read_csv(qbc_path)
+    qbc['text'] = qbc['english_quran_passage']  + "\n" + qbc['aljalalyn_tafseer'] # Combine text for TF-IDF
+    qbc['text'] = qbc['text'].fillna("")  # Ensure no NaN values in text
+    # Create unique IDs
+    qbc['passage_id'] = qbc.apply(lambda r: f"{r.surah_number}:{r.ayah_start}-{r.ayah_end}", axis=1)
+    # Load precomputed TF-IDF vectorizer and matrix
     tfidf_vectorizer = joblib.load(tfidf_vectorizer_path)
-    tfidf_matrix = np.load(tfidf_matrix_path)["arr_0"]
+    tfidf_matrix = joblib.load(tfidf_matrix_path)
     return qbc, tfidf_vectorizer, tfidf_matrix
 
 def normalize_text(text):
@@ -86,25 +94,12 @@ def dense_search_arab(query, embed_model_arab, faiss_index, qbc_arab, top_k=50):
     results = [(qbc_arab.iloc[i]['passage_id'], float(scores[0][j]), i) for j,i in enumerate(idxs[0])]
     return results
 
-def cross_encode_rerank(query, candidates, qbc_arab, tokenizer, model, device, top_k=20):
-    # candidates: list of (passage_id, dense_score, idx)
-    candidate_passages = [qbc_arab.iloc[idx]['text'] for _,_,idx in candidates]
-    candidate_ids = [pid for pid,_,_ in candidates]
-    features = tokenizer([query]*len(candidate_passages), candidate_passages, padding=True, truncation=True, return_tensors="pt")
-    features = {k: v.to(device) for k, v in features.items()}
-    with torch.no_grad():
-        outputs = model(**features)
-        # Use the positive class logit (label=1)
-        if outputs.logits.shape[1] == 2:
-            scores = outputs.logits[:, 1].cpu().numpy()
-        else:
-            scores = outputs.logits[:, 0].cpu().numpy()
-    reranked = sorted(zip(candidate_ids, scores), key=lambda x: x[1], reverse=True)
-    return reranked[:top_k]
-
 
 # Add main() wrapper for CLI
 def main_cli():
+    """Main function to run the inference script from command line.
+    example usage:
+    python quran_qa_inference.py --test_questions test_questions.csv --qpc qpc.csv --output output.tsv --tag_prefix BayaNet"""
     parser = argparse.ArgumentParser(description="Quran QA Inference Script")
     parser.add_argument("--test_questions", required=True, help="Path to test questions CSV")
     parser.add_argument("--qpc", required=True, help="Path to qpc CSV file")
@@ -128,7 +123,7 @@ def main(test_questions_path, qpc_path, output_path, tag_prefix="BayaNet"):
     for _, row in test_df.iterrows():
         qnum = row["question_number"]
         # You can choose which question text to use (english, arabic, arabic_augment)
-        question_text = row["arabic_augment"] if pd.notnull(row.get("arabic_augment", None)) and row["arabic_augment"] else (row["arabic"] if pd.notnull(row.get("arabic", None)) and row["arabic"] else row["english"])
+        question_text = row["arabic"] + "\n" + row["arabic_augment"]  if pd.notnull(row.get("arabic_augment", None)) and row["arabic_augment"] else row["arabic"]
         # For sparse, use English
         question_text_en = row["english"]
 
@@ -148,7 +143,7 @@ def main(test_questions_path, qpc_path, output_path, tag_prefix="BayaNet"):
                     fusion_dict[pid] = (score, 'dense', idx)
             else:
                 fusion_dict[pid] = (score, 'dense', idx)
-        # Prepare candidates for reranking: get text from qbc_arab if dense, else from qbc
+        # Prepare candidates for reranking: get text from qbc
         fusion_candidates = []
         for pid, (score, source, idx) in fusion_dict.items():
             if source == 'dense':
@@ -158,18 +153,15 @@ def main(test_questions_path, qpc_path, output_path, tag_prefix="BayaNet"):
         # Sort by score, take top 50 for reranking
         fusion_candidates = sorted(fusion_candidates, key=lambda x: x[1], reverse=True)[:50]
 
-        # Prepare for cross-encoder: get passage text from correct source
+        # Prepare for cross-encoder: get passage text 
         ce_candidates = []
         for pid, score, idx, source in fusion_candidates:
-            if source == 'dense':
-                ce_candidates.append((pid, score, idx, qbc_arab.iloc[idx]['text']))
-            else:
-                ce_candidates.append((pid, score, idx, qbc.iloc[idx]['text']))
+            ce_candidates.append((pid, score, idx, qbc.iloc[idx]['text']))
 
         # Cross-encoder rerank (top 20)
         candidate_passages = [x[3] for x in ce_candidates]
         candidate_ids = [x[0] for x in ce_candidates]
-        features = tokenizer([question_text]*len(candidate_passages), candidate_passages, padding=True, truncation=True, return_tensors="pt")
+        features = tokenizer([question_text_en]*len(candidate_passages), candidate_passages, padding=True, truncation=True, return_tensors="pt")
         features = {k: v.to(device) for k, v in features.items()}
         with torch.no_grad():
             outputs = model(**features)
@@ -177,7 +169,7 @@ def main(test_questions_path, qpc_path, output_path, tag_prefix="BayaNet"):
                 scores = outputs.logits[:, 1].cpu().numpy()
             else:
                 scores = outputs.logits[:, 0].cpu().numpy()
-        reranked = sorted(zip(candidate_ids, scores), key=lambda x: x[1], reverse=True)[:20]
+        reranked = sorted(zip(candidate_ids, scores), key=lambda x: x[1], reverse=True)[:5]
         for rank, (pid, score) in enumerate(reranked, 1):
             results.append({
                 "question-number": qnum,
@@ -188,7 +180,10 @@ def main(test_questions_path, qpc_path, output_path, tag_prefix="BayaNet"):
                 "tag": unique_tag
             })
     out_df = pd.DataFrame(results)
-    out_df.to_csv(output_path, index=False)
+    # save dataframe as tsv without header
+    if not output_path.endswith('.tsv'):
+        output_path += '.tsv'
+    out_df.to_csv(output_path, index=False, sep='\t', header=False)
     print(f"Results saved to {output_path}")
 
 if __name__ == "__main__":
